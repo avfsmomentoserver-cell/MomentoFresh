@@ -1,211 +1,87 @@
-"""
-Forecast Engine for MomentoFresh
-
-Generates predictions based on historical patterns and current state.
-"""
-
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, List, Optional
-
-from .config import settings
-from .analysis import AnalysisPayload, get_analysis_payload_cached
-from .db import Round, get_session, session_scope
-from .store import get_latest_round
-
-logger = logging.getLogger(__name__)
+"""Forecasting engine for MomentoFresh with STRIDE integration."""
+from typing import List, Dict, Optional, Tuple, Any, Union
+import torch
+from .stride import (
+    TeacherLLM, StudentLLM, LatentProjection, fuse_embeddings, FusionOperator,
+    get_tsfm_wrapper, forecast_with_stride, convert_to_stride_format
+)
+from .store import MomentoStore
 
 
-@dataclass
-class ForecastResult:
-    """Result of a forecast prediction."""
-    source: str
-    round_id: Optional[int]
-    predicted_min: float
-    predicted_max: float
-    predicted_multiplier: float
-    confidence: float
-    explanation: str
-    state: str = "pending"
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    scored_at: Optional[datetime] = None
-    accuracy: Optional[float] = None
+class ForecastEngine:
+    """Forecasting engine with STRIDE and Momento integration."""
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "source": self.source,
-            "round_id": self.round_id,
-            "predicted_min": self.predicted_min,
-            "predicted_max": self.predicted_max,
-            "predicted_multiplier": self.predicted_multiplier,
-            "confidence": self.confidence,
-            "explanation": self.explanation,
-            "state": self.state,
-            "created_at": self.created_at.isoformat(),
-            "scored_at": self.scored_at.isoformat() if self.scored_at else None,
-            "accuracy": self.accuracy,
-        }
+    def __init__(
+        self,
+        tsfm_name: str = "chronos-2.0",
+        use_stride: bool = False,
+        teacher_llm_api_key: Optional[str] = None,
+        momento_endpoint: Optional[str] = None,
+        momento_api_key: Optional[str] = None,
+        device: str = "cpu",
+    ):
+        self.tsfm_name = tsfm_name
+        self.use_stride = use_stride
+        self.device = device
+        self.momento_store = MomentoStore(momento_endpoint, momento_api_key) if momento_endpoint else None
+        self.teacher_llm = TeacherLLM(api_key=teacher_llm_api_key) if use_stride else None
+        self.student_llm = StudentLLM() if use_stride else None
+        self.projection = LatentProjection(4096, 512) if use_stride else None
 
-
-def generate_forecast(source: str, limit: int = settings.default_round_limit) -> ForecastResult:
-    """
-    Generate a forecast for the next round.
-    
-    Uses historical patterns to predict the next multiplier range.
-    
-    Args:
-        source: The game source
-        limit: Number of historical rounds to use
-        
-    Returns:
-        ForecastResult with prediction
-    """
-    # Get analysis payload
-    payload = get_analysis_payload_cached(source, limit)
-    
-    if not payload.rounds or len(payload.multipliers) < 10:
-        return ForecastResult(
-            source=source,
-            round_id=None,
-            predicted_min=1.0,
-            predicted_max=2.0,
-            predicted_multiplier=1.5,
-            confidence=0.0,
-            explanation="Insufficient data for forecast",
-            state="insufficient_data",
-        )
-    
-    multipliers = payload.multipliers
-    stats = payload.stats
-    patterns = payload.patterns
-    
-    # Simple forecasting based on recent trends
-    # Use last N multipliers to predict next
-    recent = multipliers[:20]  # Last 20 rounds
-    
-    # Calculate average of recent
-    avg_recent = sum(recent) / len(recent)
-    
-    # Calculate trend direction
-    if len(recent) >= 2:
-        trend = (recent[0] - recent[-1]) / len(recent)
-    else:
-        trend = 0
-    
-    # Predict based on average and trend
-    predicted_multiplier = max(1.0, avg_recent + trend)
-    
-    # Calculate confidence based on volatility
-    if stats.get("std_dev", 0) > 0:
-        volatility = stats["std_dev"] / stats["mean"] if stats["mean"] > 0 else 0
-        confidence = max(0.0, min(1.0, 1.0 - volatility))
-    else:
-        confidence = 0.5
-    
-    # Adjust confidence based on pattern strength
-    if patterns.get("streaks"):
-        streak_len = max(
-            patterns["streaks"].get("max_ascending", 0),
-            patterns["streaks"].get("max_descending", 0)
-        )
-        confidence *= min(1.0, streak_len / 10.0) * 0.5 + 0.5
-    
-    # Calculate range
-    range_size = stats.get("std_dev", 0.5) * 2
-    predicted_min = max(1.0, predicted_multiplier - range_size)
-    predicted_max = predicted_multiplier + range_size
-    
-    # Generate explanation
-    explanation_parts = []
-    if trend > 0.1:
-        explanation_parts.append(f"Upward trend detected (last 20 avg: {avg_recent:.2f}x)")
-    elif trend < -0.1:
-        explanation_parts.append(f"Downward trend detected (last 20 avg: {avg_recent:.2f}x)")
-    else:
-        explanation_parts.append(f"Stable pattern (last 20 avg: {avg_recent:.2f}x)")
-    
-    explanation_parts.append(f"Volatility: {stats.get('std_dev', 0):.2f}x")
-    explanation = "; ".join(explanation_parts)
-    
-    return ForecastResult(
-        source=source,
-        round_id=None,
-        predicted_min=round(predicted_min, 2),
-        predicted_max=round(predicted_max, 2),
-        predicted_multiplier=round(predicted_multiplier, 2),
-        confidence=round(confidence, 2),
-        explanation=explanation,
-        state="generated",
-    )
-
-
-def score_forecast(forecast: ForecastResult, actual_multiplier: float) -> ForecastResult:
-    """
-    Score a forecast against the actual result.
-    
-    Args:
-        forecast: The forecast to score
-        actual_multiplier: The actual multiplier that occurred
-        
-    Returns:
-        Updated ForecastResult with accuracy
-    """
-    if actual_multiplier < forecast.predicted_min:
-        accuracy = 0.0
-    elif actual_multiplier > forecast.predicted_max:
-        accuracy = 0.0
-    else:
-        # Linear accuracy within range
-        range_size = forecast.predicted_max - forecast.predicted_min
-        if range_size == 0:
-            accuracy = 1.0 if actual_multiplier == forecast.predicted_min else 0.0
+    def forecast(
+        self, X: List[float], E: Optional[Dict] = None, metadata: Optional[Dict] = None,
+        use_reasoning: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict]]:
+        if self.use_stride and use_reasoning:
+            Y_hat, R_hat = forecast_with_stride(
+                self.student_llm, self.tsfm_name, self.projection, X=X, E=E,
+                metadata=metadata, fusion_operator=FusionOperator.PREPEND, device=self.device
+            )
+            return Y_hat, R_hat
         else:
-            distance = abs(actual_multiplier - forecast.predicted_multiplier)
-            accuracy = max(0.0, 1.0 - (distance / (range_size / 2)))
-    
-    forecast.accuracy = round(accuracy, 2)
-    forecast.state = "scored"
-    forecast.scored_at = datetime.utcnow()
-    
-    return forecast
+            tsfm = get_tsfm_wrapper(self.tsfm_name, 512, 96, 1, self.device)
+            X_tensor = torch.tensor([X], dtype=torch.float32).to(self.device)
+            return tsfm.forecast(X_tensor)
 
+    def forecast_from_momento(self, key: str, use_reasoning: bool = True) -> Dict[str, Any]:
+        if not self.momento_store:
+            raise ValueError("Momento store not initialized.")
+        stride_data = self.momento_store.get_stride_data(key)
+        if not stride_data:
+            raise ValueError(f"Data not found: {key}")
+        X = stride_data["X"]
+        E = stride_data.get("E", {})
+        metadata = stride_data.get("metadata", {})
+        if use_reasoning and self.use_stride:
+            Y_hat, R_hat = self.forecast(X, E=E, metadata=metadata, use_reasoning=True)
+            return {"forecast": Y_hat.tolist(), "reasoning": R_hat, "metadata": metadata}
+        else:
+            Y_hat = self.forecast(X, use_reasoning=False)
+            return {"forecast": Y_hat.tolist(), "metadata": metadata}
 
-def get_forecast(source: str) -> Optional[ForecastResult]:
-    """Get the latest forecast for a source."""
-    with session_scope() as session:
-        from .db import Forecast
-        forecast = session.query(Forecast).filter(
-            Forecast.source == source
-        ).order_by(Forecast.created_at.desc()).first()
-        return forecast
+    def store_and_forecast(self, key: str, raw_data: Dict[str, Any], use_reasoning: bool = True) -> Dict[str, Any]:
+        if not self.momento_store:
+            raise ValueError("Momento store not initialized.")
+        self.momento_store.store_and_convert(key, raw_data)
+        return self.forecast_from_momento(key, use_reasoning=use_reasoning)
 
-
-def create_forecast(source: str) -> ForecastResult:
-    """
-    Create and save a new forecast.
-    
-    Args:
-        source: The game source
-        
-    Returns:
-        The created forecast
-    """
-    forecast = generate_forecast(source)
-    
-    # Save to database
-    with session_scope() as session:
-        from .db import Forecast
-        db_forecast = Forecast(
-            source=forecast.source,
-            round_id=forecast.round_id,
-            multiplier=forecast.predicted_multiplier,
-            predicted_min=forecast.predicted_min,
-            predicted_max=forecast.predicted_max,
-            confidence=forecast.confidence,
-            state=forecast.state,
-            explanation=forecast.explanation,
+    def train(self, train_data: List[Dict], epochs: int = 10, alpha: float = 0.5, beta: float = 0.5) -> None:
+        if not self.use_stride:
+            raise NotImplementedError("Training requires STRIDE.")
+        from .stride.train import train_stride
+        self.student_llm, self.projection, _ = train_stride(
+            self.teacher_llm, self.student_llm, self.tsfm_name, self.projection,
+            train_data, epochs, alpha, beta, device=self.device
         )
-        session.add(db_forecast)
-    
-    return forecast
+
+    def save_model(self, output_dir: str) -> None:
+        if not self.use_stride:
+            raise NotImplementedError("Saving requires STRIDE.")
+        from .stride.train import save_stride_model
+        save_stride_model(self.student_llm, self.projection, output_dir)
+
+    def load_model(self, input_dir: str) -> None:
+        if not self.use_stride:
+            raise NotImplementedError("Loading requires STRIDE.")
+        from .stride.train import load_stride_model
+        self.student_llm, self.projection = load_stride_model(self.student_llm, self.projection, input_dir)
