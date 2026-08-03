@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # Main API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/backend/data
+    environment:
+      - MOMENTO_API_HOST=0.0.0.0
+      - MOMENTO_API_PORT=8000
+      - MOMENTO_DATABASE_PATH=/app/backend/data/momento.db
+      - MOMENTO_FEED_AUTOSTART=false
+    restart: unless-stopped
+    networks:
+      - momento-network
+
+  # Standalone Scraper
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile.scraper
+    volumes:
+      - ./backend/data:/app/backend/data
+    environment:
+      - SCRAPER_ENABLED=true
+      - SCRAPER_INTERVAL=5
+      - SCRAPER_STORE_DB=true
+      - SCRAPER_DB_PATH=/app/backend/data/momento.db
+      - SCRAPER_BROADCAST=false
+    restart: unless-stopped
+    networks:
+      - momento-network
+    depends_on:
+      - api
+
+  # Combined service (API + Scraper)
+  full:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/backend/data
+    environment:
+      - MOMENTO_API_HOST=0.0.0.0
+      - MOMENTO_API_PORT=8000
+      - MOMENTO_DATABASE_PATH=/app/backend/data/momento.db
+      - MOMENTO_FEED_AUTOSTART=true
+      - SCRAPER_ENABLED=true
+    command: bash -c "python backend/scripts/run_scraper.py & python backend/run_api.py"
+    restart: unless-stopped
+    networks:
+      - momento-network
+
+networks:
+  momento-network:
+    driver: bridge
+
+volumes:
+  momento-data:
+    driver: local
