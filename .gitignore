@@ -1,0 +1,73 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Backend data
+backend/data/momento.db
+backend/data/momento.db-wal
+backend/data/momento.db-shm
+backend/data/inbox/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.next/
+web/.bun/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env.local
+.env.*.local
