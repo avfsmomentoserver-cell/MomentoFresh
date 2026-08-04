@@ -1,141 +1,118 @@
 
-#### 4.4 Check Deployment Status
+#### 2.4 Install Azure CLI (Optional)
 ```bash
-kubectl get pods
-kubectl get services
-```
-
-#### 4.5 Access the Application
-```bash
-kubectl get service stride-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 ```
 
 ---
 
-### Step 5: Set Up Monitoring (Optional)
+### Step 3: Clone the Repository
 
-#### 5.1 Install Prometheus and Grafana
 ```bash
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
-helm install prometheus prometheus-community/prometheus -n monitoring --create-namespace
-helm install grafana grafana/grafana -n monitoring
-```
-
-#### 5.2 Access Grafana Dashboard
-```bash
-kubectl port-forward svc/grafana 3000:80 -n monitoring &
-# Open http://localhost:3000 in your browser (default creds: admin/admin)
+git clone https://github.com/avfsmomentoserver-cell/MomentoFresh.git
+cd MomentoFresh
+git checkout feature/stride-integration
 ```
 
 ---
 
-### Step 6: Set Up CI/CD (GitHub Actions)
+### Step 4: Set Up Environment
 
-Create .github/workflows/deploy.yml:
-```yaml
-name: Deploy STRIDE to Azure
-
-on:
-  push:
-    branches: [ main, feature/stride-integration ]
-  pull_request:
-    branches: [ main ]
-
-env:
-  AZURE_RESOURCE_GROUP: stride-resources
-  AZURE_ACR_NAME: strideAcr
-  AZURE_CONTAINER_NAME: stride-container
-
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    - name: Log in to Azure
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-    - name: Build and push Docker image
-      run: |
-        cd backend
-        az acr build --registry ${{ env.AZURE_ACR_NAME }} --image stride-app:${{ github.sha }} .
-    - name: Deploy to ACI
-      run: |
-        az container create \
-          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-          --name ${{ env.AZURE_CONTAINER_NAME }} \
-          --image ${{ env.AZURE_ACR_NAME }}.azurecr.io/stride-app:${{ github.sha }} \
-          --cpu 2 \
-          --memory 4 \
-          --ports 8000 \
-          --environment-variables \
-            MOMENTO_API_KEY="${{ secrets.MOMENTO_API_KEY }}" \
-            MOMENTO_ENDPOINT="${{ secrets.MOMENTO_ENDPOINT }}" \
-            GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
-          --dns-name-label stride-app-${{ github.sha }} \
-          --restart-policy Always
+#### 4.1 Create a Virtual Environment
+```bash
+python3 -m venv venv
+source venv/bin/activate
 ```
 
-#### 6.1 Set Up GitHub Secrets
-1. Go to GitHub Repository → Settings → Secrets → Actions.
-2. Add: AZURE_CREDENTIALS, MOMENTO_API_KEY, MOMENTO_ENDPOINT, GEMINI_API_KEY.
-
----
-
----
-
-## Option 2: Debian VM on Azure (Development/Testing)
-
-Deploy STRIDE + Momento on a Debian VM on Azure for development and testing.
-
----
-
-### Step 1: Create a Debian VM on Azure
-
-#### 1.1 Create the VM
+#### 4.2 Install Dependencies
 ```bash
-az vm create \
-  --resource-group stride-resources \
-  --name stride-vm \
-  --image Debian:debian-12:12-gen2:latest \
-  --admin-username azureuser \
-  --generate-ssh-keys \
-  --size Standard_D4s_v3 \
-  --public-ip-sku Standard
+cd backend
+pip install -r requirements.txt
 ```
 
-#### 1.2 Connect to the VM
+#### 4.3 Configure Environment Variables
 ```bash
-ssh azureuser@<VM_PUBLIC_IP>
+nano backend/.env
 ```
-
-#### 1.3 Update the System
-```bash
-sudo apt update && sudo apt upgrade -y
+Add:
+```ini
+MOMENTO_API_KEY=your-momento-api-key
+MOMENTO_ENDPOINT=your-cache-endpoint.momentohq.com
+GEMINI_API_KEY=your-gemini-api-key
 ```
 
 ---
 
-### Step 2: Install Dependencies
+### Step 5: Run STRIDE Locally
 
-#### 2.1 Install Python and pip
+#### 5.1 Test the Forecasting Engine
+Create test_stride.py:
+```python
+from momento.stride import ForecastEngine
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+engine = ForecastEngine(
+    tsfm_name="chronos-2.0",
+    use_stride=True,
+    teacher_llm_api_key=os.getenv("GEMINI_API_KEY"),
+    momento_endpoint=os.getenv("MOMENTO_ENDPOINT"),
+    momento_api_key=os.getenv("MOMENTO_API_KEY"),
+)
+
+X = [1.25, 1.30, 1.28, 1.35, 1.40]
+E = {"source": "aviator"}
+
+print("Generating forecast with STRIDE...")
+Y_hat, R_hat = engine.forecast(X, E=E, use_reasoning=True)
+print(f"Forecast: {Y_hat}")
+print(f"Reasoning: {R_hat}")
+```
+Run:
 ```bash
-sudo apt install -y python3.10 python3-pip python3-venv
+python test_stride.py
 ```
 
-#### 2.2 Install Git
-```bash
-sudo apt install -y git
-```
+#### 5.2 Test with Momento
+Create test_momento.py:
+```python
+from momento.store import MomentoStore
+from momento.stride import ForecastEngine
+import os
+from dotenv import load_dotenv
 
-#### 2.3 Install Docker (Optional)
+load_dotenv()
+
+store = MomentoStore(
+    endpoint=os.getenv("MOMENTO_ENDPOINT"),
+    api_key=os.getenv("MOMENTO_API_KEY"),
+)
+
+aviator_data = {
+    "source": "aviator",
+    "collectedAt": "2026-08-04T12:00:00.000Z",
+    "rounds": [
+        {"timestamp": "2026-08-04T12:00:00.000Z", "multiplier": 1.25},
+        {"timestamp": "2026-08-04T13:00:00.000Z", "multiplier": 1.30},
+    ]
+}
+store.store_raw_data("aviator_test", aviator_data)
+
+engine = ForecastEngine(
+    tsfm_name="chronos-2.0",
+    use_stride=True,
+    teacher_llm_api_key=os.getenv("GEMINI_API_KEY"),
+    momento_endpoint=os.getenv("MOMENTO_ENDPOINT"),
+    momento_api_key=os.getenv("MOMENTO_API_KEY"),
+)
+
+result = engine.forecast_from_momento("aviator_test", use_reasoning=True)
+print(f"Forecast: {result["forecast"]}")
+print(f"Reasoning: {result["reasoning"]}")
+```
+Run:
 ```bash
-sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
-curl -fsSL https://download.docker.com/linux/debian/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io
-sudo usermod -aG docker azureuser
+python test_momento.py
 ```
